@@ -165,6 +165,15 @@ def get_all_proxies():
     conn.close()
     return rows
 
+def get_all_proxies_for_export():
+    """جلب جميع البروكسيات النشطة للتصدير"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT proxy FROM proxies WHERE status = 'active' ORDER BY success_count DESC")
+    rows = c.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
 def update_proxy_success(proxy):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -175,8 +184,16 @@ def update_proxy_success(proxy):
 def update_proxy_failure(proxy):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    
+    # 1. زيادة عداد الفشل
     c.execute("UPDATE proxies SET fail_count = fail_count + 1 WHERE proxy = ?", (proxy,))
+    
+    # 2. عند 3 فشل: تغيير الحالة إلى dead
     c.execute("UPDATE proxies SET status = 'dead' WHERE proxy = ? AND fail_count >= 3", (proxy,))
+    
+    # 3. ✅ عند 5 فشل: حذف البروكسي نهائياً من قاعدة البيانات
+    c.execute("DELETE FROM proxies WHERE proxy = ? AND fail_count >= 5", (proxy,))
+    
     conn.commit()
     conn.close()
 
@@ -260,7 +277,7 @@ class ProxyPool:
 
 proxy_pool = ProxyPool()
 
-# ================= فحص البروكسيات (مُحسّن) =================
+# ================= فحص البروكسيات =================
 def check_proxy_accurate(proxy):
     try:
         proxy_dict = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
@@ -280,41 +297,56 @@ def check_proxy_accurate(proxy):
         pass
     return None
 
-def add_proxies_to_pool_with_report(proxy_list, chat_id):
+def add_proxies_to_pool_with_report(proxy_list, chat_id, check=True):
     """إضافة البروكسيات مع إرسال تقرير للأدمن"""
     working = []
     total = len(proxy_list)
     checked = 0
     
-    # فحص 5 فقط في نفس الوقت (لتخفيف الضغط على Railway)
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(check_proxy_accurate, p): p for p in proxy_list}
-        for future in as_completed(futures):
-            res = future.result()
-            checked += 1
-            if res:
-                working.append(res)
-                proxy_pool.add_proxy(res)
-            
-            # تحديث التقدم كل 10 بروكسيات
-            if checked % 10 == 0 or checked == total:
-                try:
-                    progress = int((checked / total) * 100)
-                    bot.send_message(chat_id, 
-                        f"⏳ جاري الفحص... {checked}/{total} ({progress}%)\n"
-                        f"✅ شغال حتى الآن: {len(working)}")
-                except:
-                    pass
+    if check:
+        # فحص البروكسيات
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(check_proxy_accurate, p): p for p in proxy_list}
+            for future in as_completed(futures):
+                res = future.result()
+                checked += 1
+                if res:
+                    working.append(res)
+                    proxy_pool.add_proxy(res)
+                
+                if checked % 10 == 0 or checked == total:
+                    try:
+                        progress = int((checked / total) * 100)
+                        bot.send_message(chat_id, 
+                            f"⏳ جاري الفحص... {checked}/{total} ({progress}%)\n"
+                            f"✅ شغال حتى الآن: {len(working)}")
+                    except:
+                        pass
+    else:
+        # إضافة مباشرة بدون فحص
+        working = proxy_list
+        for proxy in proxy_list:
+            proxy_pool.add_proxy(proxy)
     
     # التقرير النهائي
-    bot.send_message(chat_id, 
-        f"✅ **انتهى الفحص**\n\n"
-        f"📊 **النتائج:**\n"
-        f"📥 إجمالي البروكسيات: {total}\n"
-        f"✅ شغالة: {len(working)}\n"
-        f"❌ ميتة: {total - len(working)}\n\n"
-        f"🎯 تم الإضافة لقاعدة البيانات بنجاح",
-        parse_mode="Markdown")
+    if check:
+        bot.send_message(chat_id, 
+            f"✅ **انتهى الفحص**\n\n"
+            f"📊 **النتائج:**\n"
+            f"📥 إجمالي البروكسيات: {total}\n"
+            f"✅ شغالة: {len(working)}\n"
+            f"❌ ميتة: {total - len(working)}\n\n"
+            f"🎯 تم الإضافة لقاعدة البيانات بنجاح",
+            parse_mode="Markdown")
+    else:
+        bot.send_message(chat_id, 
+            f"✅ **تمت الإضافة بنجاح**\n\n"
+            f"📊 **النتائج:**\n"
+            f"📥 إجمالي البروكسيات: {total}\n"
+            f"✅ تم الإضافة: {len(working)}\n\n"
+            f"⚡ تم الإضافة بدون فحص (سريع)",
+            parse_mode="Markdown")
+    
     return working
 
 # ================= البوابات =================
@@ -816,6 +848,8 @@ def show_admin_menu(user_id):
         types.InlineKeyboardButton("👥 عرض المستخدمين", callback_data="admin_view_users"),
         types.InlineKeyboardButton("🗑️ إلغاء كود", callback_data="admin_revoke_code"),
         types.InlineKeyboardButton("📡 إضافة بروكسيات", callback_data="admin_add_proxies"),
+        types.InlineKeyboardButton("⚡ إضافة سريعة", callback_data="admin_add_proxies_fast"),
+        types.InlineKeyboardButton("📤 تصدير بروكسيات", callback_data="admin_export_proxies"),
         types.InlineKeyboardButton("📊 حالة البروكسيات", callback_data="admin_proxy_stats"),
         types.InlineKeyboardButton("❌ خروج", callback_data="admin_logout")
     )
@@ -868,15 +902,45 @@ def admin_callback(call):
         admin_session[user_id] = 'awaiting_revoke'
     elif data == "admin_add_proxies":
         bot.answer_callback_query(call.id)
-        msg = "📡 **إضافة بروكسيات**\n\n"
+        msg = "📡 **إضافة بروكسيات (مع فحص)**\n\n"
         msg += "أرسل البروكسيات بأي من الطرق:\n\n"
         msg += "1️⃣ **ملف** (.txt) يحتوي على البروكسيات\n"
         msg += "2️⃣ **نص** مباشر بالشكل:\n"
         msg += "`ip:port`\n"
         msg += "`ip:port`\n\n"
-        msg += "⚠️ **ملاحظة:** البروكسيات ستُفحص تلقائياً وستُضاف الشغالة فقط"
+        msg += "⚠️ البروكسيات ستُفحص تلقائياً"
         bot.send_message(user_id, msg, parse_mode="Markdown")
         admin_session[user_id] = 'awaiting_proxies'
+    elif data == "admin_add_proxies_fast":
+        bot.answer_callback_query(call.id)
+        msg = "⚡ **إضافة سريعة (بدون فحص)**\n\n"
+        msg += "أرسل البروكسيات مباشرة:\n\n"
+        msg += "1️⃣ **ملف** (.txt)\n"
+        msg += "2️⃣ **نص** مباشر\n\n"
+        msg += "⚡ ستُضاف فوراً بدون فحص (سريع)"
+        bot.send_message(user_id, msg, parse_mode="Markdown")
+        admin_session[user_id] = 'awaiting_proxies_fast'
+    elif data == "admin_export_proxies":
+        bot.answer_callback_query(call.id)
+        proxies = get_all_proxies_for_export()
+        if not proxies:
+            bot.send_message(user_id, "📭 لا توجد بروكسيات نشطة")
+            return
+        
+        # إنشاء ملف
+        filename = f"proxies_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        with open(filename, 'w') as f:
+            f.write('\n'.join(proxies))
+        
+        # إرسال الملف
+        with open(filename, 'rb') as f:
+            bot.send_document(user_id, f, 
+                caption=f"📤 **البروكسيات النشطة**\n\n📊 العدد: {len(proxies)}",
+                parse_mode="Markdown")
+        
+        # حذف الملف المؤقت
+        os.remove(filename)
+        
     elif data == "admin_proxy_stats":
         bot.answer_callback_query(call.id)
         active, banned, dead = proxy_pool.get_stats()
@@ -886,13 +950,15 @@ def admin_callback(call):
         bot.answer_callback_query(call.id, "تم الخروج")
         bot.send_message(user_id, "👋 تم تسجيل الخروج.")
 
-@bot.message_handler(func=lambda m: admin_session.get(m.from_user.id) == 'awaiting_proxies')
+@bot.message_handler(func=lambda m: admin_session.get(m.from_user.id) in ['awaiting_proxies', 'awaiting_proxies_fast'])
 def handle_admin_proxies(message):
     """استقبال البروكسيات من الأدمن"""
     user_id = message.from_user.id
     if user_id != ADMIN_ID:
         admin_session.pop(user_id, None)
         return
+    
+    check = admin_session[user_id] == 'awaiting_proxies'
     
     proxies = []
     
@@ -917,13 +983,16 @@ def handle_admin_proxies(message):
         show_admin_menu(user_id)
         return
     
-    # بدء الفحص
-    bot.reply_to(message, f"🔍 جاري فحص {len(proxies)} بروكسي...\n⏳ قد يستغرق بعض الوقت")
+    # بدء الفحص أو الإضافة
+    if check:
+        bot.reply_to(message, f"🔍 جاري فحص {len(proxies)} بروكسي...\n⏳ قد يستغرق بعض الوقت")
+    else:
+        bot.reply_to(message, f"⚡ جاري إضافة {len(proxies)} بروكسي مباشرة...")
     
-    # الفحص في thread منفصل
+    # الفحص/الإضافة في thread منفصل
     threading.Thread(
         target=add_proxies_to_pool_with_report, 
-        args=(proxies, user_id),
+        args=(proxies, user_id, check),
         daemon=True
     ).start()
     
@@ -1091,7 +1160,7 @@ def handle_docs(message):
     user_id = message.from_user.id
     
     # إذا كان الأدمن في وضع انتظار البروكسيات
-    if admin_session.get(user_id) == 'awaiting_proxies':
+    if admin_session.get(user_id) in ['awaiting_proxies', 'awaiting_proxies_fast']:
         handle_admin_proxies(message)
         return
     
@@ -1106,7 +1175,7 @@ def handle_docs(message):
     if "proxy" in filename:
         proxies = [p.strip() for p in content.splitlines() if p.strip() and ':' in p]
         if proxies:
-            threading.Thread(target=add_proxies_to_pool_with_report, args=(proxies, user_id), daemon=True).start()
+            threading.Thread(target=add_proxies_to_pool_with_report, args=(proxies, user_id, True), daemon=True).start()
             bot.reply_to(message, f"🔍 جاري فحص {len(proxies)} بروكسي...")
         else:
             bot.reply_to(message, "❌ لا توجد بروكسيات صالحة.")
@@ -1121,7 +1190,7 @@ def handle_text(message):
     user_id = message.from_user.id
     
     # إذا كان الأدمن في وضع انتظار البروكسيات
-    if admin_session.get(user_id) == 'awaiting_proxies':
+    if admin_session.get(user_id) in ['awaiting_proxies', 'awaiting_proxies_fast']:
         handle_admin_proxies(message)
         return
     
@@ -1134,7 +1203,7 @@ def handle_text(message):
     if ":" in text and "|" not in text and not text.startswith('/'):
         proxies = [p.strip() for p in text.splitlines() if p.strip() and ':' in p]
         if proxies:
-            threading.Thread(target=add_proxies_to_pool_with_report, args=(proxies, user_id), daemon=True).start()
+            threading.Thread(target=add_proxies_to_pool_with_report, args=(proxies, user_id, True), daemon=True).start()
             bot.reply_to(message, f"🔍 جاري فحص {len(proxies)} بروكسي...")
         else:
             bot.reply_to(message, "❌ لا توجد بروكسيات صالحة.")
@@ -1159,7 +1228,9 @@ print("✅ البوت شغال مع:")
 print("  • فحص Auth متعدد البوابات (3 بوابات)")
 print("  • فحص Charge (1 بوابة)")
 print("  • نظام اشتراكات ولوحة إدارة")
-print("  • إضافة بروكسيات يدوية من الأدمن")
+print("  • إضافة بروكسيات يدوية (مع/بدون فحص)")
+print("  • تصدير البروكسيات النشطة")
+print("  • حذف تلقائي للبروكسيات الفاشلة")
 print(f"📁 قاعدة البيانات: {DB_PATH}")
 print("🔥 التوقيع: 𝕭𝖆𝕭𝖆_𝕸𝖊𝕯𝖎𝖆")
 bot.infinity_polling()
