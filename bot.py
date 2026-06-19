@@ -260,25 +260,7 @@ class ProxyPool:
 
 proxy_pool = ProxyPool()
 
-# ================= جلب البروكسيات =================
-PROXY_SOURCES = [
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt"
-]
-
-def fetch_proxies_from_github():
-    all_proxies = []
-    for url in PROXY_SOURCES:
-        try:
-            response = requests.get(url, timeout=15)
-            if response.status_code == 200:
-                proxies = response.text.strip().splitlines()
-                cleaned = [p.strip() for p in proxies if p.strip() and not p.startswith('#') and ':' in p]
-                all_proxies.extend(cleaned)
-        except:
-            pass
-    return list(set(all_proxies))
-
+# ================= فحص البروكسيات (مُحسّن) =================
 def check_proxy_accurate(proxy):
     try:
         proxy_dict = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
@@ -287,17 +269,52 @@ def check_proxy_accurate(proxy):
             return proxy
     except:
         pass
+    
+    time.sleep(0.5)
+    
+    try:
+        r = requests.get("https://httpbin.org/ip", proxies=proxy_dict, timeout=5)
+        if r.status_code == 200:
+            return proxy
+    except:
+        pass
     return None
 
-def add_proxies_to_pool(proxy_list):
+def add_proxies_to_pool_with_report(proxy_list, chat_id):
+    """إضافة البروكسيات مع إرسال تقرير للأدمن"""
     working = []
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    total = len(proxy_list)
+    checked = 0
+    
+    # فحص 5 فقط في نفس الوقت (لتخفيف الضغط على Railway)
+    with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(check_proxy_accurate, p): p for p in proxy_list}
         for future in as_completed(futures):
             res = future.result()
+            checked += 1
             if res:
                 working.append(res)
                 proxy_pool.add_proxy(res)
+            
+            # تحديث التقدم كل 10 بروكسيات
+            if checked % 10 == 0 or checked == total:
+                try:
+                    progress = int((checked / total) * 100)
+                    bot.send_message(chat_id, 
+                        f"⏳ جاري الفحص... {checked}/{total} ({progress}%)\n"
+                        f"✅ شغال حتى الآن: {len(working)}")
+                except:
+                    pass
+    
+    # التقرير النهائي
+    bot.send_message(chat_id, 
+        f"✅ **انتهى الفحص**\n\n"
+        f"📊 **النتائج:**\n"
+        f"📥 إجمالي البروكسيات: {total}\n"
+        f"✅ شغالة: {len(working)}\n"
+        f"❌ ميتة: {total - len(working)}\n\n"
+        f"🎯 تم الإضافة لقاعدة البيانات بنجاح",
+        parse_mode="Markdown")
     return working
 
 # ================= البوابات =================
@@ -316,7 +333,7 @@ CHARGE_GATE = {
 
 user_gate_choice = {}
 user_check_type = {}
-user_progress = {}  # لتتبع التقدم
+user_progress = {}
 
 BILLING_INFO = {
     'first_name': 'Oscar',
@@ -608,7 +625,6 @@ def check_card_charge_with_retry(card_str):
 
 # ================= معالجة البطاقات =================
 def update_progress_message(chat_id, message_id, current, total, check_type):
-    """تحديث رسالة التقدم"""
     try:
         progress = int((current / total) * 100)
         bar_length = 20
@@ -632,10 +648,8 @@ def update_progress_message(chat_id, message_id, current, total, check_type):
 def process_single_card_auth(card, idx, total, chat_id, progress_msg_id):
     final_status, emoji, results = check_card_multi_auth(card)
     
-    # تحديث رسالة التقدم
     update_progress_message(chat_id, progress_msg_id, idx, total, 'auth')
     
-    # إذا كانت البطاقة ميتة، لا ترسلها
     if final_status == "💀 DEAD":
         return final_status
     
@@ -669,10 +683,8 @@ def process_single_card_auth(card, idx, total, chat_id, progress_msg_id):
 def process_single_card_charge(card, idx, total, chat_id, progress_msg_id):
     status, redirect = check_card_charge_with_retry(card)
     
-    # تحديث رسالة التقدم
     update_progress_message(chat_id, progress_msg_id, idx, total, 'charge')
     
-    # إذا كانت البطاقة ميتة، لا ترسلها
     if status == "DECLINED":
         return status
     
@@ -710,7 +722,6 @@ def check_cards(cards_text, chat_id, message_id, check_type):
     
     total = len(cards)
     
-    # إرسال رسالة التقدم الأولى
     check_name = "Auth" if check_type == 'auth' else "Charge"
     progress_text = f"""⏳ **جاري الفحص...**
 
@@ -752,7 +763,6 @@ def check_cards(cards_text, chat_id, message_id, check_type):
             except:
                 declined += 1
     
-    # الملخص النهائي
     if check_type == 'auth':
         summary = f"""🏁 **انتهى الفحص**
 
@@ -805,7 +815,7 @@ def show_admin_menu(user_id):
         types.InlineKeyboardButton("📋 عرض الأكواد", callback_data="admin_view_codes"),
         types.InlineKeyboardButton("👥 عرض المستخدمين", callback_data="admin_view_users"),
         types.InlineKeyboardButton("🗑️ إلغاء كود", callback_data="admin_revoke_code"),
-        types.InlineKeyboardButton("📡 جلب بروكسيات", callback_data="admin_fetch_proxies"),
+        types.InlineKeyboardButton("📡 إضافة بروكسيات", callback_data="admin_add_proxies"),
         types.InlineKeyboardButton("📊 حالة البروكسيات", callback_data="admin_proxy_stats"),
         types.InlineKeyboardButton("❌ خروج", callback_data="admin_logout")
     )
@@ -856,10 +866,17 @@ def admin_callback(call):
         bot.answer_callback_query(call.id)
         bot.send_message(user_id, "✏️ أرسل الكود لإلغائه:")
         admin_session[user_id] = 'awaiting_revoke'
-    elif data == "admin_fetch_proxies":
+    elif data == "admin_add_proxies":
         bot.answer_callback_query(call.id)
-        bot.send_message(user_id, "📡 جاري سحب البروكسيات...")
-        threading.Thread(target=fetch_and_add_proxies, args=(user_id,)).start()
+        msg = "📡 **إضافة بروكسيات**\n\n"
+        msg += "أرسل البروكسيات بأي من الطرق:\n\n"
+        msg += "1️⃣ **ملف** (.txt) يحتوي على البروكسيات\n"
+        msg += "2️⃣ **نص** مباشر بالشكل:\n"
+        msg += "`ip:port`\n"
+        msg += "`ip:port`\n\n"
+        msg += "⚠️ **ملاحظة:** البروكسيات ستُفحص تلقائياً وستُضاف الشغالة فقط"
+        bot.send_message(user_id, msg, parse_mode="Markdown")
+        admin_session[user_id] = 'awaiting_proxies'
     elif data == "admin_proxy_stats":
         bot.answer_callback_query(call.id)
         active, banned, dead = proxy_pool.get_stats()
@@ -869,13 +886,48 @@ def admin_callback(call):
         bot.answer_callback_query(call.id, "تم الخروج")
         bot.send_message(user_id, "👋 تم تسجيل الخروج.")
 
-def fetch_and_add_proxies(user_id):
-    proxies = fetch_proxies_from_github()
-    if proxies:
-        working = add_proxies_to_pool(proxies)
-        bot.send_message(user_id, f"✅ تمت إضافة {len(working)} بروكسي.")
-    else:
-        bot.send_message(user_id, "❌ فشل سحب البروكسيات.")
+@bot.message_handler(func=lambda m: admin_session.get(m.from_user.id) == 'awaiting_proxies')
+def handle_admin_proxies(message):
+    """استقبال البروكسيات من الأدمن"""
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        admin_session.pop(user_id, None)
+        return
+    
+    proxies = []
+    
+    # إذا كان ملف
+    if message.content_type == 'document':
+        try:
+            file_info = bot.get_file(message.document.file_id)
+            content = bot.download_file(file_info.file_path).decode('utf-8', errors='ignore')
+            proxies = [p.strip() for p in content.splitlines() if p.strip() and ':' in p and not p.startswith('#')]
+        except Exception as e:
+            bot.reply_to(message, f"❌ خطأ في قراءة الملف: {e}")
+            admin_session[user_id] = 'authenticated'
+            show_admin_menu(user_id)
+            return
+    # إذا كان نص
+    elif message.text:
+        proxies = [p.strip() for p in message.text.splitlines() if p.strip() and ':' in p and not p.startswith('/')]
+    
+    if not proxies:
+        bot.reply_to(message, "❌ لم يتم العثور على بروكسيات صالحة.\nالصيغة: `ip:port`", parse_mode="Markdown")
+        admin_session[user_id] = 'authenticated'
+        show_admin_menu(user_id)
+        return
+    
+    # بدء الفحص
+    bot.reply_to(message, f"🔍 جاري فحص {len(proxies)} بروكسي...\n⏳ قد يستغرق بعض الوقت")
+    
+    # الفحص في thread منفصل
+    threading.Thread(
+        target=add_proxies_to_pool_with_report, 
+        args=(proxies, user_id),
+        daemon=True
+    ).start()
+    
+    admin_session[user_id] = 'authenticated'
 
 @bot.message_handler(func=lambda m: admin_session.get(m.from_user.id) == 'awaiting_days')
 def create_code_days(message):
@@ -908,7 +960,7 @@ def revoke_code_input(message):
     admin_session[user_id] = 'authenticated'
     show_admin_menu(user_id)
 
-# ================= أوامر البوت (مخفية - للأدمن فقط) =================
+# ================= أوامر البوت =================
 @bot.message_handler(commands=['start'])
 def start(message):
     user_id = message.from_user.id
@@ -962,7 +1014,6 @@ def user_redeem_code(message):
     bot.reply_to(message, msg)
     admin_session.pop(user_id, None)
 
-# ================= أوامر مخفية للأدمن =================
 @bot.message_handler(commands=['status'])
 def status(message):
     if message.from_user.id != ADMIN_ID:
@@ -1038,6 +1089,12 @@ def select_gate(call):
 @bot.message_handler(content_types=['document'])
 def handle_docs(message):
     user_id = message.from_user.id
+    
+    # إذا كان الأدمن في وضع انتظار البروكسيات
+    if admin_session.get(user_id) == 'awaiting_proxies':
+        handle_admin_proxies(message)
+        return
+    
     if not is_subscription_active(user_id):
         bot.reply_to(message, "⛔ اشتراكك غير نشط")
         return
@@ -1049,8 +1106,8 @@ def handle_docs(message):
     if "proxy" in filename:
         proxies = [p.strip() for p in content.splitlines() if p.strip() and ':' in p]
         if proxies:
-            threading.Thread(target=add_proxies_to_pool, args=(proxies,)).start()
-            bot.reply_to(message, f"🔍 جاري إضافة {len(proxies)} بروكسي...")
+            threading.Thread(target=add_proxies_to_pool_with_report, args=(proxies, user_id), daemon=True).start()
+            bot.reply_to(message, f"🔍 جاري فحص {len(proxies)} بروكسي...")
         else:
             bot.reply_to(message, "❌ لا توجد بروكسيات صالحة.")
     else:
@@ -1062,6 +1119,12 @@ def handle_docs(message):
 @bot.message_handler(func=lambda m: True)
 def handle_text(message):
     user_id = message.from_user.id
+    
+    # إذا كان الأدمن في وضع انتظار البروكسيات
+    if admin_session.get(user_id) == 'awaiting_proxies':
+        handle_admin_proxies(message)
+        return
+    
     if not is_subscription_active(user_id):
         bot.reply_to(message, "⛔ اشتراكك غير نشط")
         return
@@ -1071,8 +1134,8 @@ def handle_text(message):
     if ":" in text and "|" not in text and not text.startswith('/'):
         proxies = [p.strip() for p in text.splitlines() if p.strip() and ':' in p]
         if proxies:
-            threading.Thread(target=add_proxies_to_pool, args=(proxies,)).start()
-            bot.reply_to(message, f"🔍 جاري إضافة {len(proxies)} بروكسي...")
+            threading.Thread(target=add_proxies_to_pool_with_report, args=(proxies, user_id), daemon=True).start()
+            bot.reply_to(message, f"🔍 جاري فحص {len(proxies)} بروكسي...")
         else:
             bot.reply_to(message, "❌ لا توجد بروكسيات صالحة.")
     elif "|" in text:
@@ -1096,6 +1159,7 @@ print("✅ البوت شغال مع:")
 print("  • فحص Auth متعدد البوابات (3 بوابات)")
 print("  • فحص Charge (1 بوابة)")
 print("  • نظام اشتراكات ولوحة إدارة")
+print("  • إضافة بروكسيات يدوية من الأدمن")
 print(f"📁 قاعدة البيانات: {DB_PATH}")
 print("🔥 التوقيع: 𝕭𝖆𝕭𝖆_𝕸𝖊𝕯𝖎𝖆")
 bot.infinity_polling()
